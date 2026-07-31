@@ -637,6 +637,20 @@ async function runProcAndWait(
     } catch {
       // already gone
     }
+    // Windows never cascades TerminateProcess to children: sweep the whole process
+    // tree so no orphaned server can outlive the TUI. (The historical `uv run`
+    // intermediate used to leave a stray `python -m app` behind on every quit.)
+    if (process.platform === "win32") {
+      try {
+        const treeKill = Bun.spawn(["taskkill", "/PID", String(proc.pid), "/T", "/F"], {
+          stdout: "ignore",
+          stderr: "ignore",
+        })
+        void treeKill.exited.catch(() => {})
+      } catch {
+        // taskkill unavailable or process already gone — nothing left to do
+      }
+    }
   }
   // If the user backs out while we're still waiting for the relay, kill the server we just spawned.
   signal?.addEventListener("abort", stop, { once: true })
@@ -664,8 +678,16 @@ async function runSource(ctx: HostLocalContext, serverDir: string, onLog: OnLog,
   onLog("Dependencies ready", "ok")
 
   onLog("Starting the local p2p server (Iroh) — waiting for a relay, ~10s…", "step")
+  // Spawn the venv interpreter DIRECTLY instead of through `uv run`: `proc.kill()`
+  // terminates only the immediate child, and killing a `uv` wrapper on Windows would
+  // orphan the python server it spawned — a stray server kept running after every
+  // quit. After the `uv sync` above the venv is guaranteed to exist.
+  const pythonExe =
+    process.platform === "win32"
+      ? join(serverDir, ".venv", "Scripts", "python.exe")
+      : join(serverDir, ".venv", "bin", "python")
   const proc = Bun.spawn(
-    ["uv", "run", "python", "-m", "app", "--serve", "--keys", ctx.paths.keysFile],
+    [pythonExe, "-m", "app", "--serve", "--keys", ctx.paths.keysFile],
     { cwd: serverDir, stdout: "pipe", stderr: "pipe", env: serverEnv(ctx.paths) },
   )
   return runProcAndWait(ctx.paths, proc, onLog, signal)
